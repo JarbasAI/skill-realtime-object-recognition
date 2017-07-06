@@ -11,6 +11,8 @@ WIP
 # TODO
 
 bus messages to trigger
+
+
 helper class to use anywhere
 
 # logs
@@ -46,4 +48,5 @@ pip install -r requirements.txt
 ```
 
 ## Usage:
-* `View Objects`
+
+    test object recognition
