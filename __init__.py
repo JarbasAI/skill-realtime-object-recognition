@@ -23,23 +23,16 @@ from mycroft.util.log import getLogger
 import os
 import sys
 import cv2
-import time
-import multiprocessing
 import numpy as np
 import tensorflow as tf
-import datetime
-from threading import Thread
-from multiprocessing import Process, Queue, Pool
 from os.path import dirname
-from imutils.video import FPS
-from imutils.video import WebcamVideoStream
 
-sys.path.append('/opt/mycroft/skills/skill-realtime-object-recognition')
+sys.path.append(dirname(__file__))
 
 from object_detection.utils import label_map_util
 from object_detection.utils import visualization_utils as vis_util
 
-__author__ = 'eClarity'
+__author__ = 'eClarity' , 'jarbas'
 
 LOGGER = getLogger(__name__)
 
@@ -59,6 +52,7 @@ label_map = label_map_util.load_labelmap(PATH_TO_LABELS)
 categories = label_map_util.convert_label_map_to_categories(label_map, max_num_classes=NUM_CLASSES,
                                                             use_display_name=True)
 category_index = label_map_util.create_category_index(categories)
+
 
 def detect_objects(image_np, sess, detection_graph):
     # Expand dimensions since the model expects images to have shape: [1, None, None, 3]
@@ -80,106 +74,94 @@ def detect_objects(image_np, sess, detection_graph):
         feed_dict={image_tensor: image_np_expanded})
 
     # Visualization of the results of a detection.
-    vis_util.visualize_boxes_and_labels_on_image_array(
-        image_np,
-        np.squeeze(boxes),
-        np.squeeze(classes).astype(np.int32),
-        np.squeeze(scores),
-        category_index,
-        use_normalized_coordinates=True,
-        line_thickness=8)
-    return image_np
+    #vis_util.visualize_boxes_and_labels_on_image_array(
+    #    image_np,
+    #    np.squeeze(boxes),
+    #    np.squeeze(classes).astype(np.int32),
+    #    np.squeeze(scores),
+    #    category_index,
+    #    use_normalized_coordinates=True,
+    #    line_thickness=8)
+    return image_np, boxes, scores, classes, num_detections
 
 
-def worker(input_q, output_q):
-    # Load a (frozen) Tensorflow model into memory.
-    detection_graph = tf.Graph()
-    with detection_graph.as_default():
-        od_graph_def = tf.GraphDef()
-        with tf.gfile.GFile(PATH_TO_CKPT, 'rb') as fid:
-            serialized_graph = fid.read()
-            od_graph_def.ParseFromString(serialized_graph)
-            tf.import_graph_def(od_graph_def, name='')
-
-        sess = tf.Session(graph=detection_graph)
-
-    fps = FPS().start()
-    while True:
-        fps.update()
-        frame = input_q.get()
-        output_q.put(detect_objects(frame, sess, detection_graph))
-
-    fps.stop()
-    sess.close()
-
-
-    logger = multiprocessing.log_to_stderr()
-    logger.setLevel(multiprocessing.SUBDEBUG)
-
-    input_q = Queue(maxsize=5)
-    output_q = Queue(maxsize=5)
-
-    process = Process(target=worker, args=((input_q, output_q)))
-    process.daemon = True
-    pool = Pool(2, worker, (input_q, output_q))
-
-    video_capture = WebcamVideoStream(src=0,
-                                      width=720,
-                                      height=480).start()
-
-
-class RealtimeObjectRecogSkill(MycroftSkill):
+class ObjectRecogSkill(MycroftSkill):
     def __init__(self):
-        super(RealtimeObjectRecogSkill, self).__init__(name="RealtimeObjectRecogSkill")
+        super(ObjectRecogSkill, self).__init__(name="ObjectRecogSkill")
 
     def initialize(self):
-        view_objects_intent = IntentBuilder("ViewOjbectsIntent"). \
-            require("ViewObjectsKeyword").build()
+        view_objects_intent = IntentBuilder("TestObjectRecogIntent"). \
+            require("TestViewObjectsKeyword").build()
         self.register_intent(view_objects_intent, self.handle_view_objects_intent)
 
-
     def handle_view_objects_intent(self, message):
-	self.speak('Showing you what objects I see now')
-	logger = multiprocessing.log_to_stderr()
-        logger.setLevel(multiprocessing.SUBDEBUG)
+        self.speak('Testing object recognition')
+        # Load a (frozen) Tensorflow model into memory.
+        self.log.info("Loading tensorflow model into memory")
+        detection_graph = tf.Graph()
+        with detection_graph.as_default():
+            od_graph_def = tf.GraphDef()
+            with tf.gfile.GFile(PATH_TO_CKPT, 'rb') as fid:
+                serialized_graph = fid.read()
+                od_graph_def.ParseFromString(serialized_graph)
+                tf.import_graph_def(od_graph_def, name='')
 
-        input_q = Queue(maxsize=5)
-        output_q = Queue(maxsize=5)
+        sess = tf.Session(graph=detection_graph)
+        self.log.info("Loading test image")
+        frame = cv2.imread(dirname(__file__) + "/test.jpg")
+        self.log.info("Detecting objects")
+        image_np, boxes, scores, classes, num_detections = detect_objects(frame, sess, detection_graph)
+        objects = []
+        self.log.info("Processing labels")
+        for i in classes:
+            for c in i:
+                obj = {}
+                c = int(c)
+                if c in category_index.keys():
+                    class_name = category_index[c]['name']
+                else:
+                    class_name = 'N/A'
+                obj["label"] = class_name
+                objects.append(obj)
 
-        process = Process(target=worker, args=((input_q, output_q)))
-        process.daemon = True
-        pool = Pool(2, worker, (input_q, output_q))
+        self.log.info("Processing scores")
+        for i in scores:
+            o = 0
+            for c in i:
+                c = int(c * 100)
+                objects[o]["score"] = c
+                o += 1
 
-        video_capture = WebcamVideoStream(src=0).start()
-        fps = FPS().start()
+        self.log.info("Processing bounding boxes")
+        for i in boxes:
+            o = 0
+            for c in i:
+                # TODO process into x,y coords rects
+                objects[o]["box"] = c
+                o += 1
 
-        while True:  # fps._numFrames < 120
-            frame = video_capture.read()
-            input_q.put(frame)
+        self.log.info("Counting objects and removing low scores")
+        labels = {}
+        for obj in objects:
+            # bypass low scores
+            if obj["score"] < 30:
+                continue
+            if obj["label"] not in labels.keys():
+                labels[obj["label"]] = 1
+            else:
+                labels[obj["label"]] += 1
 
-            t = time.time()
-
-            cv2.imshow('Video', output_q.get())
-            fps.update()
-
-            print('[INFO] elapsed time: {:.2f}'.format(time.time() - t))
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-        fps.stop()
-        print('[INFO] elapsed time (total): {:.2f}'.format(fps.elapsed()))
-        print('[INFO] approx. FPS: {:.2f}'.format(fps.fps()))
-
-        video_capture.stop()
-        cv2.destroyAllWindows()
-
+        self.log.info("detected : " + str(labels))
+        ut = ""
+        for object in labels:
+            ut += str(labels[object]) + " " + object + " \n"
+        self.speak(ut)
 
     def stop(self):
         pass
 
 
 def create_skill():
-    return RealtimeObjectRecogSkill()
+    return ObjectRecogSkill()
 
 
