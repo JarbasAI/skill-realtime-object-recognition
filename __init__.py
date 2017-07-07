@@ -19,7 +19,9 @@ from adapt.intent import IntentBuilder
 
 from mycroft.skills.core import MycroftSkill
 from mycroft.util.log import getLogger
-
+from mycroft.messagebus.message import Message
+import urllib
+from time import time, sleep
 import os
 import sys
 import cv2
@@ -30,7 +32,6 @@ from os.path import dirname
 sys.path.append(dirname(__file__))
 
 from object_detection.utils import label_map_util
-from object_detection.utils import visualization_utils as vis_util
 
 __author__ = 'eClarity' , 'jarbas'
 
@@ -94,9 +95,23 @@ class ObjectRecogSkill(MycroftSkill):
             require("TestViewObjectsKeyword").build()
         self.register_intent(view_objects_intent, self.handle_view_objects_intent)
 
+        self.emitter.on("object.recognition.request", self.handle_recognition_request)
+
     def handle_view_objects_intent(self, message):
         self.speak('Testing object recognition')
-        # Load a (frozen) Tensorflow model into memory.
+        objrecog = ObjectRecogService(self.emitter, timeout=30)
+        result = objrecog.recognize_objects(dirname(__file__) + "/test.jpg", server=False)
+        labels = result.get("labels", {})
+        ut = ""
+        for object in labels:
+            count = labels[object]
+            ut += str(count) + " " + object + " \n"
+        self.speak(ut)
+
+    def handle_recognition_request(self, message):
+        if message.context is not None:
+            self.context.update(message.context)
+        file = message.data.get("file", dirname(__file__) + "/test.jpg")
         self.log.info("Loading tensorflow model into memory")
         detection_graph = tf.Graph()
         with detection_graph.as_default():
@@ -107,8 +122,8 @@ class ObjectRecogSkill(MycroftSkill):
                 tf.import_graph_def(od_graph_def, name='')
 
         sess = tf.Session(graph=detection_graph)
-        self.log.info("Loading test image")
-        frame = cv2.imread(dirname(__file__) + "/test.jpg")
+        self.log.info("Loading image")
+        frame = cv2.imread(file)
         self.log.info("Detecting objects")
         image_np, boxes, scores, classes, num_detections = detect_objects(frame, sess, detection_graph)
         objects = []
@@ -137,7 +152,7 @@ class ObjectRecogSkill(MycroftSkill):
             o = 0
             for c in i:
                 # TODO process into x,y coords rects
-                objects[o]["box"] = c
+                #objects[o]["box"] = c
                 o += 1
 
         self.log.info("Counting objects and removing low scores")
@@ -151,11 +166,14 @@ class ObjectRecogSkill(MycroftSkill):
             else:
                 labels[obj["label"]] += 1
 
-        self.log.info("detected : " + str(labels))
-        ut = ""
-        for object in labels:
-            ut += str(labels[object]) + " " + object + " \n"
-        self.speak(ut)
+        self.log.info("detected : " + str(objects))
+        self.emitter.emit(Message("object.recognition.result", {"labels": labels, "objects": objects}, self.context))
+        # to source socket
+        if ":" in self.context.get("source", ""):
+            if self.context["destinatary"].split(":")[1].isdigit():
+                self.emitter.emit(Message("message_request",
+                                          {"context": self.context, "data": {"labels": labels, "objects": objects},
+                                           "type": "object.recognition.result"}, self.context))
 
     def stop(self):
         pass
@@ -165,3 +183,124 @@ def create_skill():
     return ObjectRecogSkill()
 
 
+def url_to_pic(url):
+    saved_url = dirname(__file__) + "/temp.jpg"
+    f = open(saved_url, 'wb')
+    f.write(urllib.urlopen(url).read())
+    f.close()
+    return saved_url
+
+
+class ServiceBackend(object):
+    """
+        Base class for all service implementations.
+
+        Args:
+            name: name of service (str)
+            emitter: eventemitter or websocket object
+            timeout: time in seconds to wait for response (int)
+            waiting_messages: end wait on any of these messages (list)
+
+    """
+
+    def __init__(self, name, emitter=None, timeout=5, waiting_messages=None, logger=None):
+        self.initialize(name, emitter, timeout, waiting_messages, logger)
+
+    def initialize(self, name, emitter, timeout, waiting_messages, logger):
+        """
+           initialize emitter, register events, initialize internal variables
+        """
+        self.name = name
+        self.emitter = emitter
+        self.timeout = timeout
+        self.result = None
+        self.waiting = False
+        self.waiting_for = "any"
+        if logger is None:
+            self.logger = getLogger(self.name)
+        else:
+            self.logger = logger
+        if waiting_messages is None:
+            waiting_messages = []
+        self.waiting_messages = waiting_messages
+        for msg in waiting_messages:
+            self.emitter.on(msg, self.end_wait)
+        self.context = {"source": self.name, "waiting_for": self.waiting_messages}
+
+    def send_request(self, message_type, message_data=None, message_context=None, server=False):
+        """
+          send message
+        """
+        if message_data is None:
+            message_data = {}
+        if message_context is None:
+            message_context = {"source": self.name, "waiting_for": self.waiting_messages}
+        if not server:
+            self.emitter.emit(Message(message_type, message_data, message_context))
+        else:
+            type = "bus"
+            if "file" in message_data.keys():
+                type = "file"
+            self.emitter.emit(Message("server_request",
+                                      {"server_msg_type": type, "requester": self.name,
+                                       "message_type": message_type,
+                                       "message_data": message_data}, message_context))
+
+    def wait(self, waiting_for="any"):
+        """
+            wait until result response or time_out
+            waiting_for: message that ends wait, by default use any of waiting_messages list
+            returns True if result received, False on timeout
+        """
+        self.waiting_for = waiting_for
+        if self.waiting_for != "any" and self.waiting_for not in self.waiting_messages:
+            self.emitter.on(waiting_for, self.end_wait)
+            self.waiting_messages.append(waiting_for)
+        self.waiting = True
+        start = time()
+        elapsed = 0
+        while self.waiting and elapsed < self.timeout:
+            elapsed = time() - start
+            sleep(0.3)
+        self.process_result()
+        return not self.waiting
+
+    def end_wait(self, message):
+        """
+            Check if this is the message we were waiting for and save result
+        """
+        if self.waiting_for == "any" or message.type == self.waiting_for:
+            self.result = message.data
+            if message.context is None:
+                message.context = {}
+            self.context.update(message.context)
+            self.waiting = False
+
+    def get_result(self):
+        """
+            return last processed result
+        """
+        return self.result
+
+    def process_result(self):
+        """
+         process and return only desired data
+         """
+        if self.result is None:
+            self.result = {}
+        return self.result
+
+
+class ObjectRecogService(ServiceBackend):
+    def __init__(self, emitter=None, timeout=25, waiting_messages=None, logger=None):
+        super(ObjectRecogService, self).__init__(name="ObjectRecogService", emitter=emitter, timeout=timeout, waiting_messages=waiting_messages, logger=logger)
+
+    def recognize_objects(self, picture_path, context=None, server=False):
+        self.send_request("object.recognition.request", {"file": picture_path}, context, server=server)
+        self.wait("object.recognition.result")
+        return self.result
+
+    def recognize_objects_from_url(self, picture_url, context=None, server=False):
+        self.send_request("object.recognition.request", {"url": url_to_pic(picture_url)}, context, server=server)
+        self.wait("object.recognition.result")
+        return self.result

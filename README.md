@@ -6,14 +6,19 @@ This skill is a proof of concept to use tensorflow and openCV to provide object 
 
 Hopefully this is just a start and with optimization and further development this skill will provide a concept to create more skills around object recognition
 
-WIP
 
 # TODO
 
-bus messages to trigger
+parse bounding boxes
 
+# ObjectRecogService
 
 helper class to use anywhere
+
+
+        objrecog = ObjectRecogService(self.emitter, timeout=30)
+        result = objrecog.recognize_objects(dirname(__file__) + "/test.jpg", server=False)
+        labels = result.get("labels", {})
 
 # logs
 
